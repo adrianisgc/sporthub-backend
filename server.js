@@ -9,19 +9,25 @@ const PUPPETEER_FLAGS = [
   '--no-sandbox',
   '--disable-setuid-sandbox',
   '--disable-dev-shm-usage',
-  '--disable-gpu'
+  '--disable-gpu',
+  '--single-process'
 ];
 
-// 1. Endpoint Agenda (Protegido contra caídas de Render)
+let browserInstance = null;
+async function getBrowser() {
+  if (!browserInstance || !browserInstance.isConnected()) {
+    browserInstance = await puppeteer.launch({ headless: true, args: PUPPETEER_FLAGS });
+  }
+  return browserInstance;
+}
+
+// 1. Scraping de la Agenda de Partidos
 app.get('/api/agenda', async (req, res) => {
-  let browser = null;
+  let page = null;
   try {
-    browser = await puppeteer.launch({ headless: true, args: PUPPETEER_FLAGS });
-    const page = await browser.newPage();
+    const browser = await getBrowser();
+    page = await browser.newPage();
     
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-    
-    // Bloquear elementos pesados para ahorrar memoria
     await page.setRequestInterception(true);
     page.on('request', (r) => {
       if (['image', 'stylesheet', 'font', 'media'].includes(r.resourceType())) {
@@ -31,6 +37,7 @@ app.get('/api/agenda', async (req, res) => {
       }
     });
 
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
     await page.goto('https://futbolvivo.tv/', { waitUntil: 'domcontentloaded', timeout: 35000 });
     await page.waitForSelector('a', { timeout: 8000 }).catch(() => {});
 
@@ -62,41 +69,71 @@ app.get('/api/agenda', async (req, res) => {
       return results;
     });
 
-    await browser.close();
+    await page.close();
     return res.json({ success: true, count: events.length, events });
 
   } catch (error) {
-    if (browser) await browser.close().catch(() => {});
-    return res.json({ 
-      success: false, 
-      count: 0, 
-      events: [],
-      message: 'Error temporal de carga' 
-    });
+    if (page) await page.close().catch(() => {});
+    return res.json({ success: false, count: 0, events: [] });
   }
 });
 
-// 2. Proxy Anti-Bloqueos Ligero
+// 2. Proxy Extractor: Clica automáticamente la señal y extrae el reproductor real
 app.get('/api/proxy', async (req, res) => {
   const targetUrl = req.query.url;
   if (!targetUrl) return res.status(400).send('Falta la URL');
 
+  let page = null;
   try {
-    const response = await fetch(targetUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Referer': 'https://futbolvivo.tv/'
-      }
+    const browser = await getBrowser();
+    page = await browser.newPage();
+
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
+
+    // Simular clic automático en los botones de "Opción 1" / "Señal 1" si existen en la web origen
+    await page.evaluate(() => {
+      const clickables = Array.from(document.querySelectorAll('button, a, .opcion, .senial, [class*="option"], [class*="btn"]'));
+      const targetBtn = clickables.find(el => {
+        const txt = (el.innerText || '').toLowerCase();
+        return txt.includes('opcion') || txt.includes('opción') || txt.includes('señal') || txt.includes('senial') || txt.includes('stream');
+      });
+      if (targetBtn) targetBtn.click();
+    }).catch(() => {});
+
+    // Esperar a que el script de origen cree e inserte el iframe del reproductor
+    await new Promise(r => setTimeout(r, 2000));
+
+    // Buscar la URL del iframe activo del reproductor
+    const realEmbedUrl = await page.evaluate(() => {
+      const iframes = Array.from(document.querySelectorAll('iframe'));
+      const playerIframe = iframes.find(i => 
+        i.src && 
+        !i.src.includes('google') && 
+        !i.src.includes('facebook') && 
+        !i.src.includes('analytics') &&
+        !i.src.includes('doubleclick')
+      );
+      return playerIframe ? playerIframe.src : null;
     });
 
-    let html = await response.text();
-    const parsedUrl = new URL(targetUrl);
-    const baseUrl = `${parsedUrl.protocol}//${parsedUrl.host}${parsedUrl.pathname}`;
+    await page.close();
 
-    const injectedHead = `
+    const finalUrl = realEmbedUrl || targetUrl;
+
+    res.removeHeader('X-Frame-Options');
+    res.removeHeader('Content-Security-Policy');
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    return res.send(`
+      <!DOCTYPE html>
+      <html lang="es">
       <head>
-        <base href="${baseUrl}">
+        <meta charset="utf-8">
         <meta name="referrer" content="no-referrer">
+        <style>
+          html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #000; overflow: hidden; }
+          iframe { width: 100%; height: 100%; border: 0; }
+        </style>
         <script>
           window.open = function() { return null; };
           window.alert = function() {};
@@ -105,20 +142,19 @@ app.get('/api/proxy', async (req, res) => {
             Object.defineProperty(window, 'parent', { get: function() { return window.self; } });
           } catch(e) {}
         </script>
-    `;
-
-    html = html.replace(/<head>/i, injectedHead);
-
-    res.removeHeader('X-Frame-Options');
-    res.removeHeader('Content-Security-Policy');
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    return res.send(html);
+      </head>
+      <body>
+        <iframe src="${finalUrl}" allowfullscreen allow="autoplay; encrypted-media; picture-in-picture"></iframe>
+      </body>
+      </html>
+    `);
 
   } catch (e) {
+    if (page) await page.close().catch(() => {});
     return res.status(500).send(`
       <style>body{background:#060913;color:#fff;font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;}</style>
       <div style="text-align:center;">
-        <h3>No se pudo cargar la señal</h3>
+        <h3>No se pudo obtener la señal en directo</h3>
         <p style="font-size:12px;color:#888;">Intenta seleccionar otro evento de la lista.</p>
       </div>
     `);
@@ -126,6 +162,4 @@ app.get('/api/proxy', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`🚀 Servidor SportHub Pro activo en puerto ${PORT}`);
-});
+app.listen(PORT, () => console.log(`🚀 Servidor activo en puerto ${PORT}`));
