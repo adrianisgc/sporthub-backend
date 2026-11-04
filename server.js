@@ -59,7 +59,7 @@ app.get('/api/agenda', async (req, res) => {
   }
 });
 
-// Proxy Anti-Bloqueos (sin dependencias externas)
+// Proxy Extractor: Extrae solo el iframe del reproductor limpia sin menús de la web
 app.get('/api/proxy', async (req, res) => {
   const targetUrl = req.query.url;
   if (!targetUrl) return res.status(400).send('Falta la URL');
@@ -72,36 +72,67 @@ app.get('/api/proxy', async (req, res) => {
       }
     });
 
-    let html = await response.text();
-    const parsedUrl = new URL(targetUrl);
-    const baseUrl = `${parsedUrl.protocol}//${parsedUrl.host}${parsedUrl.pathname}`;
+    const html = await response.text();
+    
+    // Buscar el iframe real del reproductor dentro del código de la página
+    const iframeMatches = [...html.matchAll(/<iframe[^>]+src=["']([^"']+)["']/gi)].map(m => m[1]);
+    
+    // Filtrar iframes de publicidad o contadores
+    const validIframes = iframeMatches.filter(src => 
+      !src.includes('googletagmanager') && 
+      !src.includes('facebook') && 
+      !src.includes('analytics') &&
+      !src.includes('doubleclick')
+    );
 
-    const cleanHead = `
-      <head>
-        <base href="${baseUrl}">
-        <script>
-          try {
-            Object.defineProperty(window, 'top', { get: function() { return window.self; } });
-            Object.defineProperty(window, 'parent', { get: function() { return window.self; } });
-          } catch(e) {}
-          window.open = function() { return null; };
-          window.alert = function() {};
-        </script>
-    `;
+    let playerUrl = validIframes[0] || null;
 
-    html = html.replace(/<head>/i, cleanHead);
+    if (playerUrl) {
+      // Ajustar URLs relativas si existen
+      if (playerUrl.startsWith('/')) {
+        const parsed = new URL(targetUrl);
+        playerUrl = `${parsed.protocol}//${parsed.host}${playerUrl}`;
+      } else if (!playerUrl.startsWith('http')) {
+        const parsed = new URL(targetUrl);
+        playerUrl = `${parsed.protocol}//${parsed.host}/${playerUrl}`;
+      }
 
+      // Entregar únicamente el reproductor ocupando el 100% de tu pantalla
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      return res.send(`
+        <!DOCTYPE html>
+        <html lang="es">
+        <head>
+          <meta charset="utf-8">
+          <style>
+            html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #000; overflow: hidden; }
+            iframe { width: 100%; height: 100%; border: 0; }
+          </style>
+          <script>
+            window.open = function() { return null; };
+            window.alert = function() {};
+          </script>
+        </head>
+        <body>
+          <iframe src="${playerUrl}" allowfullscreen allow="autoplay; encrypted-media; picture-in-picture"></iframe>
+        </body>
+        </html>
+      `);
+    }
+
+    // Si la web no usa iframe directo, devolvemos el HTML limpio de anuncios
+    let cleanHtml = html.replace(/<head>/i, `<head><script>window.open=function(){};window.alert=function(){};</script>`);
     res.removeHeader('X-Frame-Options');
     res.removeHeader('Content-Security-Policy');
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    
-    return res.send(html);
+    return res.send(cleanHtml);
 
   } catch (e) {
     return res.status(500).send(`
       <style>body{background:#000;color:#fff;font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;}</style>
       <div style="text-align:center;">
-        <h3>Conectando con la señal en directo...</h3>
+        <h3>No se pudo obtener el reproductor.</h3>
+        <p style="font-size:12px;color:#888;">Prueba con otro partido de la agenda.</p>
       </div>
     `);
   }
