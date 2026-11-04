@@ -1,24 +1,19 @@
 const express = require('express');
 const puppeteer = require('puppeteer');
 const cors = require('cors');
+const axios = require('axios');
 
 const app = express();
 app.use(cors());
 
+// Agenda de partidos
 app.get('/api/agenda', async (req, res) => {
   let browser = null;
   try {
-    console.log('🔄 Buscando partidos y extrayendo enlaces directos...');
-    
+    console.log('🔄 Cargando agenda de partidos...');
     browser = await puppeteer.launch({
       headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--disable-gpu'
-      ]
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
     });
 
     const page = await browser.newPage();
@@ -27,7 +22,6 @@ app.get('/api/agenda', async (req, res) => {
     await page.goto('https://futbolvivo.tv/', { waitUntil: 'domcontentloaded', timeout: 45000 });
     await page.waitForSelector('.match-item, .event-item, tr, li', { timeout: 10000 }).catch(() => {});
 
-    // Extraer partidos y buscar flujos directos si es posible
     const events = await page.evaluate(() => {
       const items = document.querySelectorAll('a');
       let results = [];
@@ -58,68 +52,47 @@ app.get('/api/agenda', async (req, res) => {
       return results;
     });
 
-    console.log(`✅ Agenda sincronizada: ${events.length} eventos encontrados.`);
     await browser.close();
-
     res.json({ success: true, count: events.length, events });
 
   } catch (error) {
-    console.error('❌ Error en el servidor:', error);
     if (browser) await browser.close();
     res.status(500).json({ success: false, error: error.message, events: [] });
   }
 });
 
-// NUEVA RUTA: Extrae el flujo de vídeo limpio del enlace del partido para evitar bloqueos e iframes con anuncios
-app.get('/api/resolve', async (req, res) => {
+// 🛡️ PROXY ANTI-BLOQUEOS: Salta X-Frame-Options y limpia publicidad
+app.get('/api/proxy', async (req, res) => {
   const targetUrl = req.query.url;
-  if (!targetUrl) return res.status(400).json({ success: false, error: 'Falta la URL' });
+  if (!targetUrl) return res.status(400).send('Falta URL');
 
-  let browser = null;
   try {
-    browser = await puppeteer.launch({
-      headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
+    const response = await axios.get(targetUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Referer': targetUrl
+      },
+      responseType: 'text',
+      timeout: 10000
     });
 
-    const page = await browser.newPage();
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+    // 1. Eliminar cabeceras que provocan el rechazo de conexión
+    res.removeHeader('X-Frame-Options');
+    res.removeHeader('Content-Security-Policy');
 
-    let videoSource = '';
-
-    // Interceptar peticiones de red para cazar enlaces de vídeo HLS (.m3u8) o reproductores internos directos
-    page.on('request', (req) => {
-      const u = req.url();
-      if (u.includes('.m3u8') || u.includes('.mp4') || u.includes('embed') || u.includes('player')) {
-        if (!videoSource && !u.includes('ads')) {
-          videoSource = u;
-        }
-      }
-    });
-
-    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    let html = response.data;
     
-    // Esperar un par de segundos a que el reproductor interno cargue su script
-    await new Promise(r => setTimeout(r, 4000));
+    // 2. Inyectar desinfección anti pop-ups
+    html = html.replace('<head>', '<head><script>window.open = function(){}; window.alert = function(){};</script>');
 
-    // Si no capturó un .m3u8 por red, buscar iframes internos dentro de la página del partido
-    if (!videoSource) {
-      videoSource = await page.evaluate(() => {
-        const iframe = document.querySelector('iframe');
-        return iframe ? iframe.src : '';
-      });
-    }
-
-    await browser.close();
-    res.json({ success: true, stream: videoSource || targetUrl });
-
+    res.setHeader('Content-Type', 'text/html');
+    res.send(html);
   } catch (e) {
-    if (browser) await browser.close();
-    res.json({ success: false, stream: targetUrl }); // Si falla, devuelve la original
+    res.send(`<style>body{background:#060913;color:#fff;font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;}</style><div><h2>Cargando señal...</h2><script>setTimeout(()=>location.reload(), 3000);</script></div>`);
   }
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 Servidor inteligente activo en el puerto ${PORT}`);
+  console.log(`🚀 Servidor Proxy activo en el puerto ${PORT}`);
 });
