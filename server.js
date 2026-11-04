@@ -1,7 +1,6 @@
 const express = require('express');
 const puppeteer = require('puppeteer');
 const cors = require('cors');
-const axios = require('axios');
 
 const app = express();
 app.use(cors());
@@ -60,30 +59,27 @@ app.get('/api/agenda', async (req, res) => {
   }
 });
 
-// Proxy desinfectante con bypass de Framebusting y dominio base
+// Proxy Anti-Bloqueos (sin dependencias externas)
 app.get('/api/proxy', async (req, res) => {
   const targetUrl = req.query.url;
   if (!targetUrl) return res.status(400).send('Falta la URL');
 
   try {
-    const response = await axios.get(targetUrl, {
+    const response = await fetch(targetUrl, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Referer': 'https://futbolvivo.tv/'
-      },
-      timeout: 15000
+      }
     });
 
-    let html = response.data;
+    let html = await response.text();
     const parsedUrl = new URL(targetUrl);
     const baseUrl = `${parsedUrl.protocol}//${parsedUrl.host}${parsedUrl.pathname}`;
 
-    // Inyección de scripts de camuflaje antes de cargar el reproductor
-    const stealthHeader = `
+    const cleanHead = `
       <head>
         <base href="${baseUrl}">
         <script>
-          // Engañar a los detectores de iframe para que crean que es la pestaña principal
           try {
             Object.defineProperty(window, 'top', { get: function() { return window.self; } });
             Object.defineProperty(window, 'parent', { get: function() { return window.self; } });
@@ -93,9 +89,8 @@ app.get('/api/proxy', async (req, res) => {
         </script>
     `;
 
-    html = html.replace(/<head>/i, stealthHeader);
+    html = html.replace(/<head>/i, cleanHead);
 
-    // Eliminar restricciones de seguridad en las cabeceras
     res.removeHeader('X-Frame-Options');
     res.removeHeader('Content-Security-Policy');
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
@@ -106,8 +101,7 @@ app.get('/api/proxy', async (req, res) => {
     return res.status(500).send(`
       <style>body{background:#000;color:#fff;font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;}</style>
       <div style="text-align:center;">
-        <h3>Conectando con el servidor del partido...</h3>
-        <p style="font-size:12px;color:#888;">Si tarda en responder, prueba seleccionar otro evento de la lista.</p>
+        <h3>Conectando con la señal en directo...</h3>
       </div>
     `);
   }
