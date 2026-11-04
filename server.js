@@ -1,7 +1,6 @@
 const express = require('express');
 const puppeteer = require('puppeteer');
 const cors = require('cors');
-const axios = require('axios');
 
 const app = express();
 app.use(cors());
@@ -10,7 +9,6 @@ app.use(cors());
 app.get('/api/agenda', async (req, res) => {
   let browser = null;
   try {
-    console.log('🔄 Cargando agenda de partidos...');
     browser = await puppeteer.launch({
       headless: true,
       args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
@@ -20,7 +18,7 @@ app.get('/api/agenda', async (req, res) => {
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
     await page.goto('https://futbolvivo.tv/', { waitUntil: 'domcontentloaded', timeout: 45000 });
-    await page.waitForSelector('.match-item, .event-item, tr, li', { timeout: 10000 }).catch(() => {});
+    await page.waitForSelector('a', { timeout: 10000 }).catch(() => {});
 
     const events = await page.evaluate(() => {
       const items = document.querySelectorAll('a');
@@ -34,7 +32,7 @@ app.get('/api/agenda', async (req, res) => {
           let lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
           
           let time = lines.find(l => /^\d{2}:\d{2}$/.test(l)) || 'En Vivo';
-          let eventName = lines.find(l => l.toLowerCase().includes('vs')) || lines[0] || 'Partido sin nombre';
+          let eventName = lines.find(l => l.toLowerCase().includes('vs')) || lines[0] || 'Partido en Directo';
           let league = lines.find(l => !l.includes('vs') && !/^\d{2}:\d{2}$/.test(l)) || 'Deportes';
 
           if (href && !results.some(r => r.streamUrl === href)) {
@@ -61,38 +59,62 @@ app.get('/api/agenda', async (req, res) => {
   }
 });
 
-// 🛡️ PROXY ANTI-BLOQUEOS: Salta X-Frame-Options y limpia publicidad
+// Ruta Proxy limpia (soluciona "Cannot GET /api/proxy")
 app.get('/api/proxy', async (req, res) => {
   const targetUrl = req.query.url;
-  if (!targetUrl) return res.status(400).send('Falta URL');
+  if (!targetUrl) return res.status(400).send('Falta la URL');
 
+  let browser = null;
   try {
-    const response = await axios.get(targetUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Referer': targetUrl
-      },
-      responseType: 'text',
-      timeout: 10000
+    browser = await puppeteer.launch({
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
     });
 
-    // 1. Eliminar cabeceras que provocan el rechazo de conexión
-    res.removeHeader('X-Frame-Options');
-    res.removeHeader('Content-Security-Policy');
+    const page = await browser.newPage();
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
-    let html = response.data;
-    
-    // 2. Inyectar desinfección anti pop-ups
-    html = html.replace('<head>', '<head><script>window.open = function(){}; window.alert = function(){};</script>');
+    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
+    await new Promise(r => setTimeout(r, 2000));
+
+    // Extraer iframe interno del reproductor
+    const embedUrl = await page.evaluate(() => {
+      const iframe = document.querySelector('iframe');
+      return iframe ? iframe.src : null;
+    });
+
+    await browser.close();
+
+    const finalUrl = embedUrl || targetUrl;
 
     res.setHeader('Content-Type', 'text/html');
-    res.send(html);
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="utf-8">
+        <style>
+          html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #000; overflow: hidden; }
+          iframe { width: 100%; height: 100%; border: 0; }
+        </style>
+        <script>
+          window.open = function() { return null; };
+          window.alert = function() {};
+        </script>
+      </head>
+      <body>
+        <iframe src="${finalUrl}" allowfullscreen allow="autoplay; encrypted-media; picture-in-picture"></iframe>
+      </body>
+      </html>
+    `);
+
   } catch (e) {
-    res.send(`<style>body{background:#060913;color:#fff;font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;}</style><div><h2>Cargando señal...</h2><script>setTimeout(()=>location.reload(), 3000);</script></div>`);
+    if (browser) await browser.close();
+    res.status(500).send('Error al cargar la señal');
   }
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 Servidor Proxy activo en el puerto ${PORT}`);
+  console.log(`🚀 Servidor activo en el puerto ${PORT}`);
 });
