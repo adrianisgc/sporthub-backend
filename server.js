@@ -1,6 +1,7 @@
 const express = require('express');
 const puppeteer = require('puppeteer');
 const cors = require('cors');
+const axios = require('axios');
 
 const app = express();
 app.use(cors());
@@ -59,62 +60,60 @@ app.get('/api/agenda', async (req, res) => {
   }
 });
 
-// Ruta Proxy limpia (soluciona "Cannot GET /api/proxy")
+// Proxy desinfectante con bypass de Framebusting y dominio base
 app.get('/api/proxy', async (req, res) => {
   const targetUrl = req.query.url;
   if (!targetUrl) return res.status(400).send('Falta la URL');
 
-  let browser = null;
   try {
-    browser = await puppeteer.launch({
-      headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
+    const response = await axios.get(targetUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Referer': 'https://futbolvivo.tv/'
+      },
+      timeout: 15000
     });
 
-    const page = await browser.newPage();
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+    let html = response.data;
+    const parsedUrl = new URL(targetUrl);
+    const baseUrl = `${parsedUrl.protocol}//${parsedUrl.host}${parsedUrl.pathname}`;
 
-    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
-    await new Promise(r => setTimeout(r, 2000));
-
-    // Extraer iframe interno del reproductor
-    const embedUrl = await page.evaluate(() => {
-      const iframe = document.querySelector('iframe');
-      return iframe ? iframe.src : null;
-    });
-
-    await browser.close();
-
-    const finalUrl = embedUrl || targetUrl;
-
-    res.setHeader('Content-Type', 'text/html');
-    res.send(`
-      <!DOCTYPE html>
-      <html>
+    // Inyección de scripts de camuflaje antes de cargar el reproductor
+    const stealthHeader = `
       <head>
-        <meta charset="utf-8">
-        <style>
-          html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #000; overflow: hidden; }
-          iframe { width: 100%; height: 100%; border: 0; }
-        </style>
+        <base href="${baseUrl}">
         <script>
+          // Engañar a los detectores de iframe para que crean que es la pestaña principal
+          try {
+            Object.defineProperty(window, 'top', { get: function() { return window.self; } });
+            Object.defineProperty(window, 'parent', { get: function() { return window.self; } });
+          } catch(e) {}
           window.open = function() { return null; };
           window.alert = function() {};
         </script>
-      </head>
-      <body>
-        <iframe src="${finalUrl}" allowfullscreen allow="autoplay; encrypted-media; picture-in-picture"></iframe>
-      </body>
-      </html>
-    `);
+    `;
+
+    html = html.replace(/<head>/i, stealthHeader);
+
+    // Eliminar restricciones de seguridad en las cabeceras
+    res.removeHeader('X-Frame-Options');
+    res.removeHeader('Content-Security-Policy');
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    
+    return res.send(html);
 
   } catch (e) {
-    if (browser) await browser.close();
-    res.status(500).send('Error al cargar la señal');
+    return res.status(500).send(`
+      <style>body{background:#000;color:#fff;font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;}</style>
+      <div style="text-align:center;">
+        <h3>Conectando con el servidor del partido...</h3>
+        <p style="font-size:12px;color:#888;">Si tarda en responder, prueba seleccionar otro evento de la lista.</p>
+      </div>
+    `);
   }
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 Servidor activo en el puerto ${PORT}`);
+  console.log(`🚀 Servidor activo en puerto ${PORT}`);
 });
