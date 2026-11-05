@@ -13,7 +13,7 @@ const PUPPETEER_FLAGS = [
   '--single-process'
 ];
 
-// 1. Scraping Agenda (Lectura inicial ligera)
+// 1. Agenda Completa (Fútbol, Básquet, Motor/F1) en hora española
 app.get('/api/agenda', async (req, res) => {
   let browser = null;
   try {
@@ -37,24 +37,42 @@ app.get('/api/agenda', async (req, res) => {
     const events = await page.evaluate(() => {
       const links = Array.from(document.querySelectorAll('a'));
       let results = [];
-      
+
       links.forEach((el, index) => {
         const text = (el.innerText || '').trim();
         const href = el.href || '';
         
-        if (href && (text.toLowerCase().includes('vs') || text.toLowerCase().includes('-'))) {
+        if (href && (text.toLowerCase().includes('vs') || text.toLowerCase().includes('-') || text.toLowerCase().includes('grand prix') || text.toLowerCase().includes('f1'))) {
           let lines = text.split('\n').map(l => l.trim()).filter(Boolean);
-          let time = lines.find(l => /^\d{2}:\d{2}$/.test(l)) || 'En Vivo';
-          let eventName = lines.find(l => l.toLowerCase().includes('vs')) || lines[0] || 'Partido en Directo';
-          let league = lines.find(l => !l.includes('vs') && !/^\d{2}:\d{2}$/.test(l)) || 'Deportes';
+          
+          let timeMatch = lines.find(l => /^\d{2}:\d{2}$/.test(l));
+          let time = timeMatch || 'En Vivo';
+          
+          let eventName = lines.find(l => l.toLowerCase().includes('vs') || l.toLowerCase().includes('f1') || l.toLowerCase().includes('gp')) || lines[0] || 'Evento Deportivo';
+          let league = lines.find(l => !l.includes('vs') && !/^\d{2}:\d{2}$/.test(l)) || 'General';
 
-          if (!results.some(r => r.streamUrl === href)) {
+          // Detectar deporte
+          let sport = 'FUTBOL';
+          const fullStr = (eventName + ' ' + league).toLowerCase();
+          if (fullStr.includes('f1') || fullStr.includes('formula') || fullStr.includes('moto') || fullStr.includes('nascar') || fullStr.includes('rally')) {
+            sport = 'MOTOR';
+          } else if (fullStr.includes('basket') || fullStr.includes('nba') || fullStr.includes('acb') || fullStr.includes('euroleague')) {
+            sport = 'BASKET';
+          }
+
+          let existing = results.find(r => r.strEvent.toLowerCase() === eventName.toLowerCase());
+          if (existing) {
+            if (!existing.options.some(o => o.url === href)) {
+              existing.options.push({ name: `Canal ${existing.options.length + 1}`, url: href });
+            }
+          } else {
             results.push({
               idEvent: 'ev_' + index,
               strEvent: eventName.replace(/\n/g, ' '),
               strLeague: league,
               strTime: time,
-              streamUrl: href
+              sport: sport,
+              options: [{ name: 'Canal 1', url: href }]
             });
           }
         }
@@ -63,76 +81,21 @@ app.get('/api/agenda', async (req, res) => {
     });
 
     await browser.close();
-    return res.json({ success: true, count: events.length, events });
 
-  } catch (error) {
-    if (browser) await browser.close().catch(() => {});
-    return res.json({ success: false, count: 0, events: [] });
-  }
-});
+    // Ordenar por la hora más próxima al reloj actual de España (CET)
+    const now = new Date();
+    const currentMinutes = now.getHours() * 60 + now.getMinutes();
 
-// 2. Proxy Ultra-Rápido por HTTP (Respuesta instantánea sin saturar RAM ni timeouts)
-app.get('/api/proxy', async (req, res) => {
-  const targetUrl = req.query.url;
-  if (!targetUrl) return res.status(400).send('Falta la URL');
+    events.sort((a, b) => {
+      if (a.strTime === 'En Vivo') return -1;
+      if (b.strTime === 'En Vivo') return 1;
+      
+      const parseMin = (tStr) => {
+        const parts = tStr.split(':');
+        return parseInt(parts[0], 10) * 60 + parseInt(parts[1], 10);
+      };
 
-  try {
-    const response = await fetch(targetUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Referer': 'https://futbolvivo.tv/',
-        'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8'
-      }
-    });
+      let minA = parseMin(a.strTime);
+      let minB = parseMin(b.strTime);
 
-    let html = await response.text();
-    const parsedUrl = new URL(targetUrl);
-    const baseUrl = `${parsedUrl.protocol}//${parsedUrl.host}${parsedUrl.pathname}`;
-
-    // Script de autoclic cliente y anulación de ventanas emergentes / bloqueos de iframe
-    const stealthCode = `
-      <head>
-        <base href="${baseUrl}">
-        <meta name="referrer" content="no-referrer">
-        <script>
-          window.open = function() { return null; };
-          window.alert = function() {};
-          try {
-            Object.defineProperty(window, 'top', { get: function() { return window.self; } });
-            Object.defineProperty(window, 'parent', { get: function() { return window.self; } });
-          } catch(e) {}
-
-          // Auto-click inteligente al cargar la señal
-          document.addEventListener('DOMContentLoaded', function() {
-            setTimeout(function() {
-              var btns = Array.from(document.querySelectorAll('button, a, .opcion, .senial, [class*="option"], [class*="btn"]'));
-              var target = btns.find(function(el) {
-                var t = (el.innerText || '').toLowerCase();
-                return t.includes('opcion') || t.includes('opción') || t.includes('señal') || t.includes('senial') || t.includes('stream') || t.includes('ver');
-              });
-              if (target) target.click();
-            }, 500);
-          });
-        </script>
-    `;
-
-    html = html.replace(/<head>/i, stealthCode);
-
-    res.removeHeader('X-Frame-Options');
-    res.removeHeader('Content-Security-Policy');
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    return res.send(html);
-
-  } catch (e) {
-    return res.status(500).send(`
-      <style>body{background:#060913;color:#fff;font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;}</style>
-      <div style="text-align:center;">
-        <h3>Error al conectar con la señal</h3>
-        <p style="font-size:12px;color:#888;">Intenta seleccionar otro evento de la lista.</p>
-      </div>
-    `);
-  }
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Servidor activo en puerto ${PORT}`));
+      let diffA
