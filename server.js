@@ -13,7 +13,7 @@ const PUPPETEER_FLAGS = [
   '--single-process'
 ];
 
-// 1. Scraping de la Agenda Completa (Fútbol, Básquet, F1/Motor)
+// 1. Scraping Agenda (Fútbol, Básquet, Motor/F1) resolviendo URLs relativas
 app.get('/api/agenda', async (req, res) => {
   let browser = null;
   try {
@@ -22,40 +22,48 @@ app.get('/api/agenda', async (req, res) => {
     
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
     
-    await page.setRequestInterception(true);
-    page.on('request', (r) => {
-      if (['image', 'stylesheet', 'font', 'media'].includes(r.resourceType())) {
-        r.abort();
-      } else {
-        r.continue();
-      }
+    await page.goto('https://futbolvivo.tv/', { waitUntil: 'networkidle2', timeout: 30000 }).catch(async () => {
+      await page.goto('https://futbolvivo.tv/', { waitUntil: 'domcontentloaded', timeout: 20000 });
     });
 
-    await page.goto('https://futbolvivo.tv/', { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForSelector('a', { timeout: 8000 }).catch(() => {});
+    await new Promise(r => setTimeout(r, 1500));
 
     const events = await page.evaluate(() => {
       const links = Array.from(document.querySelectorAll('a'));
       let results = [];
 
       links.forEach((el, index) => {
-        const text = (el.innerText || '').trim();
-        const href = el.href || '';
+        const rawText = (el.innerText || el.textContent || '').trim();
+        let href = el.getAttribute('href') || '';
         
-        if (href && href.startsWith('http') && (text.toLowerCase().includes('vs') || text.toLowerCase().includes('-') || text.toLowerCase().includes('grand prix') || text.toLowerCase().includes('f1'))) {
-          let lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+        if (!href || href === '#' || href.startsWith('javascript:')) return;
+
+        // Convertir URLs relativas a absolutas para no descartar partidos
+        try {
+          href = new URL(href, window.location.origin).href;
+        } catch(e) {}
+
+        const text = rawText.replace(/\s+/g, ' ');
+
+        const isMatch = text.toLowerCase().includes('vs') || 
+                        text.includes('-') || 
+                        text.toLowerCase().includes('f1') || 
+                        text.toLowerCase().includes('gp') ||
+                        text.toLowerCase().includes('grand prix') ||
+                        /\b\d{2}:\d{2}\b/.test(text);
+
+        if (isMatch && href) {
+          let timeMatch = text.match(/\b\d{2}:\d{2}\b/);
+          let time = timeMatch ? timeMatch[0] : 'En Vivo';
           
-          let timeMatch = lines.find(l => /^\d{2}:\d{2}$/.test(l));
-          let time = timeMatch || 'En Vivo';
-          
-          let eventName = lines.find(l => l.toLowerCase().includes('vs') || l.toLowerCase().includes('f1') || l.toLowerCase().includes('gp')) || lines[0] || 'Evento Deportivo';
-          let league = lines.find(l => !l.includes('vs') && !/^\d{2}:\d{2}$/.test(l)) || 'General';
+          let eventName = text.replace(/\b\d{2}:\d{2}\b/g, '').trim();
+          if (!eventName || eventName.length < 3) eventName = `Evento Deportivo ${index + 1}`;
 
           let sport = 'FUTBOL';
-          const fullStr = (eventName + ' ' + league).toLowerCase();
-          if (fullStr.includes('f1') || fullStr.includes('formula') || fullStr.includes('moto') || fullStr.includes('nascar') || fullStr.includes('rally')) {
+          const lower = (eventName + ' ' + href).toLowerCase();
+          if (lower.includes('f1') || lower.includes('formula') || lower.includes('moto') || lower.includes('nascar') || lower.includes('gp')) {
             sport = 'MOTOR';
-          } else if (fullStr.includes('basket') || fullStr.includes('nba') || fullStr.includes('acb') || fullStr.includes('euroleague')) {
+          } else if (lower.includes('basket') || lower.includes('nba') || lower.includes('acb') || lower.includes('euroleague')) {
             sport = 'BASKET';
           }
 
@@ -67,8 +75,8 @@ app.get('/api/agenda', async (req, res) => {
           } else {
             results.push({
               idEvent: 'ev_' + index,
-              strEvent: eventName.replace(/\n/g, ' '),
-              strLeague: league,
+              strEvent: eventName,
+              strLeague: sport === 'MOTOR' ? 'Motor / F1' : (sport === 'BASKET' ? 'Baloncesto' : 'Fútbol'),
               strTime: time,
               sport: sport,
               options: [{ name: 'Señal 1', url: href }]
@@ -76,11 +84,11 @@ app.get('/api/agenda', async (req, res) => {
           }
         }
       });
+
       return results;
     });
 
     await browser.close();
-    browser = null;
 
     // Ordenar por hora española (CET) más cercana al reloj actual
     const now = new Date();
@@ -95,11 +103,11 @@ app.get('/api/agenda', async (req, res) => {
       if (isLiveB) return 1;
 
       const parseMin = (tStr) => {
-        if (!tStr || typeof tStr !== 'string' || !tStr.includes(':')) return 9999;
+        if (!tStr || !tStr.includes(':')) return 9999;
         const parts = tStr.split(':');
         const h = parseInt(parts[0], 10);
         const m = parseInt(parts[1], 10);
-        return isNaN(h) || isNaN(m) ? 9999 : h * 60 + m;
+        return (isNaN(h) || isNaN(m)) ? 9999 : h * 60 + m;
       };
 
       let minA = parseMin(a.strTime);
@@ -122,19 +130,13 @@ app.get('/api/agenda', async (req, res) => {
   }
 });
 
-// 2. Extractor de Reproductor Interno Directo
+// 2. HTTP Proxy Directo
 app.get('/api/proxy', async (req, res) => {
   const targetUrl = req.query.url;
   if (!targetUrl) return res.status(400).send('Falta la URL');
 
   try {
-    let parsedUrl;
-    try {
-      parsedUrl = new URL(targetUrl);
-    } catch (urlErr) {
-      return res.status(400).send('URL no válida');
-    }
-
+    let parsedUrl = new URL(targetUrl);
     const response = await fetch(targetUrl, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
@@ -145,17 +147,13 @@ app.get('/api/proxy', async (req, res) => {
 
     let html = await response.text();
 
-    // Extraer iframe del reproductor incrustado de la señal
     const iframeMatches = [...html.matchAll(/<iframe[^>]+src=["']([^"']+)["']/gi)].map(m => m[1]);
-    const embedMatches = [...html.matchAll(/(?:src|file|link|url)["']?\s*[:=]\s*["'](https?:\/\/[^"']+(?:embed|player|stream|live|hls|m3u8)[^"']*)["']/gi)].map(m => m[1]);
-    
-    const candidateUrls = [...iframeMatches, ...embedMatches].filter(src => 
+    const candidateUrls = iframeMatches.filter(src => 
       src && 
       !src.includes('google') && 
       !src.includes('facebook') && 
       !src.includes('analytics') &&
-      !src.includes('doubleclick') &&
-      !src.includes('twitter')
+      !src.includes('doubleclick')
     );
 
     let finalPlayerUrl = candidateUrls[0] || null;
@@ -196,7 +194,6 @@ app.get('/api/proxy', async (req, res) => {
       `);
     }
 
-    // Fallback: Si no hay iframe anidado, inyectar ocultado de menús y auto-clic sobre la plantilla de origen
     const baseUrl = `${parsedUrl.protocol}//${parsedUrl.host}${parsedUrl.pathname}`;
     const stealthCode = `
       <head>
@@ -242,7 +239,7 @@ app.get('/api/proxy', async (req, res) => {
   } catch (e) {
     return res.status(500).send(`
       <style>body{background:#060913;color:#fff;font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;}</style>
-      <div style="text-align:center;"><h3>Error al sintonizar canal</h3></div>
+      <div style="text-align:center;"><h3>Error al cargar el reproductor</h3></div>
     `);
   }
 });
