@@ -13,7 +13,7 @@ const PUPPETEER_FLAGS = [
   '--single-process'
 ];
 
-// 1. Agenda Completa (Fútbol, Básquet, Motor/F1) en hora española
+// 1. Scraping de la Agenda Completa (Fútbol, Básquet, F1/Motor)
 app.get('/api/agenda', async (req, res) => {
   let browser = null;
   try {
@@ -42,7 +42,7 @@ app.get('/api/agenda', async (req, res) => {
         const text = (el.innerText || '').trim();
         const href = el.href || '';
         
-        if (href && (text.toLowerCase().includes('vs') || text.toLowerCase().includes('-') || text.toLowerCase().includes('grand prix') || text.toLowerCase().includes('f1'))) {
+        if (href && href.startsWith('http') && (text.toLowerCase().includes('vs') || text.toLowerCase().includes('-') || text.toLowerCase().includes('grand prix') || text.toLowerCase().includes('f1'))) {
           let lines = text.split('\n').map(l => l.trim()).filter(Boolean);
           
           let timeMatch = lines.find(l => /^\d{2}:\d{2}$/.test(l));
@@ -62,7 +62,7 @@ app.get('/api/agenda', async (req, res) => {
           let existing = results.find(r => r.strEvent.toLowerCase() === eventName.toLowerCase());
           if (existing) {
             if (!existing.options.some(o => o.url === href)) {
-              existing.options.push({ name: `Canal ${existing.options.length + 1}`, url: href });
+              existing.options.push({ name: `Señal ${existing.options.length + 1}`, url: href });
             }
           } else {
             results.push({
@@ -71,7 +71,7 @@ app.get('/api/agenda', async (req, res) => {
               strLeague: league,
               strTime: time,
               sport: sport,
-              options: [{ name: 'Canal 1', url: href }]
+              options: [{ name: 'Señal 1', url: href }]
             });
           }
         }
@@ -82,7 +82,7 @@ app.get('/api/agenda', async (req, res) => {
     await browser.close();
     browser = null;
 
-    // Ordenamiento seguro (evita errores de comparación NaN)
+    // Ordenar por hora española (CET) más cercana al reloj actual
     const now = new Date();
     const currentMinutes = now.getHours() * 60 + now.getMinutes();
 
@@ -99,8 +99,7 @@ app.get('/api/agenda', async (req, res) => {
         const parts = tStr.split(':');
         const h = parseInt(parts[0], 10);
         const m = parseInt(parts[1], 10);
-        if (isNaN(h) || isNaN(m)) return 9999;
-        return h * 60 + m;
+        return isNaN(h) || isNaN(m) ? 9999 : h * 60 + m;
       };
 
       let minA = parseMin(a.strTime);
@@ -123,7 +122,7 @@ app.get('/api/agenda', async (req, res) => {
   }
 });
 
-// 2. HTTP Proxy Blindado
+// 2. Extractor de Reproductor Interno Directo
 app.get('/api/proxy', async (req, res) => {
   const targetUrl = req.query.url;
   if (!targetUrl) return res.status(400).send('Falta la URL');
@@ -145,12 +144,69 @@ app.get('/api/proxy', async (req, res) => {
     });
 
     let html = await response.text();
-    const baseUrl = `${parsedUrl.protocol}//${parsedUrl.host}${parsedUrl.pathname}`;
 
+    // Extraer iframe del reproductor incrustado de la señal
+    const iframeMatches = [...html.matchAll(/<iframe[^>]+src=["']([^"']+)["']/gi)].map(m => m[1]);
+    const embedMatches = [...html.matchAll(/(?:src|file|link|url)["']?\s*[:=]\s*["'](https?:\/\/[^"']+(?:embed|player|stream|live|hls|m3u8)[^"']*)["']/gi)].map(m => m[1]);
+    
+    const candidateUrls = [...iframeMatches, ...embedMatches].filter(src => 
+      src && 
+      !src.includes('google') && 
+      !src.includes('facebook') && 
+      !src.includes('analytics') &&
+      !src.includes('doubleclick') &&
+      !src.includes('twitter')
+    );
+
+    let finalPlayerUrl = candidateUrls[0] || null;
+
+    if (finalPlayerUrl) {
+      if (finalPlayerUrl.startsWith('//')) {
+        finalPlayerUrl = 'https:' + finalPlayerUrl;
+      } else if (finalPlayerUrl.startsWith('/')) {
+        finalPlayerUrl = `${parsedUrl.protocol}//${parsedUrl.host}${finalPlayerUrl}`;
+      }
+
+      res.removeHeader('X-Frame-Options');
+      res.removeHeader('Content-Security-Policy');
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      return res.send(`
+        <!DOCTYPE html>
+        <html lang="es">
+        <head>
+          <meta charset="utf-8">
+          <meta name="referrer" content="no-referrer">
+          <style>
+            html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #000; overflow: hidden; }
+            iframe { width: 100%; height: 100%; border: 0; }
+          </style>
+          <script>
+            window.open = function() { return null; };
+            window.alert = function() {};
+            try {
+              Object.defineProperty(window, 'top', { get: function() { return window.self; } });
+              Object.defineProperty(window, 'parent', { get: function() { return window.self; } });
+            } catch(e) {}
+          </script>
+        </head>
+        <body>
+          <iframe src="${finalPlayerUrl}" allowfullscreen allow="autoplay; encrypted-media; picture-in-picture"></iframe>
+        </body>
+        </html>
+      `);
+    }
+
+    // Fallback: Si no hay iframe anidado, inyectar ocultado de menús y auto-clic sobre la plantilla de origen
+    const baseUrl = `${parsedUrl.protocol}//${parsedUrl.host}${parsedUrl.pathname}`;
     const stealthCode = `
       <head>
         <base href="${baseUrl}">
         <meta name="referrer" content="no-referrer">
+        <style>
+          header, footer, nav, .sidebar, .ads, .advertisement, .header, .footer, .menu { display: none !important; }
+          html, body { background: #000 !important; margin: 0 !important; padding: 0 !important; width: 100% !important; height: 100% !important; overflow: hidden !important; }
+          iframe, video, #player, .player { width: 100% !important; height: 100% !important; position: absolute !important; top: 0 !important; left: 0 !important; }
+        </style>
         <script>
           window.open = function() { return null; };
           window.alert = function() {};
@@ -167,7 +223,7 @@ app.get('/api/proxy', async (req, res) => {
                 return t.includes('opcion') || t.includes('opción') || t.includes('señal') || t.includes('senial') || t.includes('stream') || t.includes('ver');
               });
               if (target) target.click();
-            }, 400);
+            }, 300);
           });
         </script>
     `;
@@ -186,7 +242,7 @@ app.get('/api/proxy', async (req, res) => {
   } catch (e) {
     return res.status(500).send(`
       <style>body{background:#060913;color:#fff;font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;}</style>
-      <div style="text-align:center;"><h3>Error al sintonizar canal</h3><p style="font-size:12px;color:#888;">${e.message || ''}</p></div>
+      <div style="text-align:center;"><h3>Error al sintonizar canal</h3></div>
     `);
   }
 });
