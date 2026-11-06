@@ -13,7 +13,7 @@ const PUPPETEER_FLAGS = [
   '--single-process'
 ];
 
-// 1. Scraping Agenda (Fútbol, Básquet, Motor/F1) resolviendo URLs relativas
+// 1. Scraping Agenda (Fútbol, Básquet, Motor/F1)
 app.get('/api/agenda', async (req, res) => {
   let browser = null;
   try {
@@ -22,10 +22,7 @@ app.get('/api/agenda', async (req, res) => {
     
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
     
-    await page.goto('https://futbolvivo.tv/', { waitUntil: 'networkidle2', timeout: 30000 }).catch(async () => {
-      await page.goto('https://futbolvivo.tv/', { waitUntil: 'domcontentloaded', timeout: 20000 });
-    });
-
+    await page.goto('https://futbolvivo.tv/', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
     await new Promise(r => setTimeout(r, 1500));
 
     const events = await page.evaluate(() => {
@@ -38,18 +35,18 @@ app.get('/api/agenda', async (req, res) => {
         
         if (!href || href === '#' || href.startsWith('javascript:')) return;
 
-        // Convertir URLs relativas a absolutas para no descartar partidos
         try {
           href = new URL(href, window.location.origin).href;
         } catch(e) {}
 
         const text = rawText.replace(/\s+/g, ' ');
+        const lowerText = text.toLowerCase();
 
-        const isMatch = text.toLowerCase().includes('vs') || 
+        const isMatch = lowerText.includes('vs') || 
                         text.includes('-') || 
-                        text.toLowerCase().includes('f1') || 
-                        text.toLowerCase().includes('gp') ||
-                        text.toLowerCase().includes('grand prix') ||
+                        lowerText.includes('f1') || 
+                        lowerText.includes('gp') ||
+                        lowerText.includes('grand prix') ||
                         /\b\d{2}:\d{2}\b/.test(text);
 
         if (isMatch && href) {
@@ -90,7 +87,7 @@ app.get('/api/agenda', async (req, res) => {
 
     await browser.close();
 
-    // Ordenar por hora española (CET) más cercana al reloj actual
+    // Ordenar por hora española (CET) más cercana
     const now = new Date();
     const currentMinutes = now.getHours() * 60 + now.getMinutes();
 
@@ -130,7 +127,7 @@ app.get('/api/agenda', async (req, res) => {
   }
 });
 
-// 2. HTTP Proxy Directo
+// 2. HTTP Proxy con bypass de Mixed Content (HTTP -> HTTPS) y extracción de redirectus.net
 app.get('/api/proxy', async (req, res) => {
   const targetUrl = req.query.url;
   if (!targetUrl) return res.status(400).send('Falta la URL');
@@ -147,8 +144,14 @@ app.get('/api/proxy', async (req, res) => {
 
     let html = await response.text();
 
-    const iframeMatches = [...html.matchAll(/<iframe[^>]+src=["']([^"']+)["']/gi)].map(m => m[1]);
-    const candidateUrls = iframeMatches.filter(src => 
+    // Extraer enlaces de servidores de streaming (redirectus.net, latin, us.html, etc.)
+    const streamMatches = [
+      ...html.matchAll(/(https?:\/\/[^"'\s<>]*redirectus[^"'\s<>]*)/gi),
+      ...html.matchAll(/(https?:\/\/[^"'\s<>]*latin\/[^"'\s<>]*)/gi),
+      ...html.matchAll(/<iframe[^>]+src=["']([^"']+)["']/gi)
+    ].map(m => m[1]);
+
+    const candidateUrls = streamMatches.filter(src => 
       src && 
       !src.includes('google') && 
       !src.includes('facebook') && 
@@ -165,6 +168,9 @@ app.get('/api/proxy', async (req, res) => {
         finalPlayerUrl = `${parsedUrl.protocol}//${parsedUrl.host}${finalPlayerUrl}`;
       }
 
+      // Transformar HTTP a HTTPS para evitar el bloqueo del navegador en Netlify
+      finalPlayerUrl = finalPlayerUrl.replace(/^http:\/\//i, 'https://');
+
       res.removeHeader('X-Frame-Options');
       res.removeHeader('Content-Security-Policy');
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
@@ -174,6 +180,7 @@ app.get('/api/proxy', async (req, res) => {
         <head>
           <meta charset="utf-8">
           <meta name="referrer" content="no-referrer">
+          <meta http-equiv="Content-Security-Policy" content="upgrade-insecure-requests">
           <style>
             html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #000; overflow: hidden; }
             iframe { width: 100%; height: 100%; border: 0; }
@@ -199,6 +206,7 @@ app.get('/api/proxy', async (req, res) => {
       <head>
         <base href="${baseUrl}">
         <meta name="referrer" content="no-referrer">
+        <meta http-equiv="Content-Security-Policy" content="upgrade-insecure-requests">
         <style>
           header, footer, nav, .sidebar, .ads, .advertisement, .header, .footer, .menu { display: none !important; }
           html, body { background: #000 !important; margin: 0 !important; padding: 0 !important; width: 100% !important; height: 100% !important; overflow: hidden !important; }
