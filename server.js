@@ -13,7 +13,7 @@ const PUPPETEER_FLAGS = [
   '--single-process'
 ];
 
-// 1. Scraping Directo y Completo de tarjetarojadirect.live
+// 1. Scraping Robust de la Agenda en tarjetarojadirect.live
 app.get('/api/agenda', async (req, res) => {
   let browser = null;
   try {
@@ -22,104 +22,113 @@ app.get('/api/agenda', async (req, res) => {
     
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36');
     
-    // Carga de la web de Tarjeta Roja esperando al renderizado dinámico
-    await page.goto('https://tarjetarojadirect.live/', { waitUntil: 'networkidle2', timeout: 35000 }).catch(async () => {
-      await page.goto('https://tarjetarojadirect.live/', { waitUntil: 'domcontentloaded', timeout: 20000 });
-    });
-
+    await page.goto('https://tarjetarojadirect.live/', { waitUntil: 'domcontentloaded', timeout: 35000 }).catch(() => {});
     await new Promise(r => setTimeout(r, 2500));
 
-    const events = await page.evaluate(() => {
-      let items = [];
+    let events = await page.evaluate(() => {
+      let results = [];
+      const nodes = Array.from(document.querySelectorAll('div, tr, li, article, section, p'));
 
-      // Buscar todos los bloques que contengan partidos (hora + vs/- + enlaces)
-      const allElements = Array.from(document.querySelectorAll('div, tr, li, article'));
-      const matchRows = allElements.filter(el => {
-        const txt = el.innerText || '';
-        return /\b\d{1,2}:\d{2}\b/.test(txt) && 
-               (txt.includes('VS') || txt.includes('vs') || txt.includes('-')) && 
-               el.querySelectorAll('a').length > 0;
-      });
-
-      // Quedarse únicamente con los contenedores más específicos (nodos hoja)
-      const leafRows = matchRows.filter(row => !matchRows.some(other => other !== row && row.contains(other)));
-
-      leafRows.forEach((row, index) => {
-        const rawText = (row.innerText || '').trim();
-        const lines = rawText.split('\n').map(l => l.trim()).filter(Boolean);
+      // Filtrar bloques que tengan formato de partidos
+      nodes.forEach((el, index) => {
+        const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+        const hasTime = /\b\d{1,2}:\d{2}\b/.test(text);
+        const hasVs = text.toLowerCase().includes('vs') || text.includes('-');
         
-        const timeMatch = rawText.match(/\b\d{1,2}:\d{2}\b/);
-        const time = timeMatch ? timeMatch[0] : 'EN VIVO';
+        if (hasTime && hasVs && el.children.length < 15) {
+          const timeMatch = text.match(/\b\d{1,2}:\d{2}\b/);
+          const time = timeMatch ? timeMatch[0] : 'EN VIVO';
 
-        // Categorías reales de Tarjeta Roja
-        let sport = 'FÚTBOL';
-        const upper = rawText.toUpperCase();
-        if (upper.includes('BALONCESTO') || upper.includes('BASKET') || upper.includes('NBA')) sport = 'BALONCESTO';
-        else if (upper.includes('HOCKEY') || upper.includes('NHL')) sport = 'HOCKEY';
-        else if (upper.includes('AMERICANO') || upper.includes('NFL')) sport = 'AMERICANO';
-        else if (upper.includes('BÉISBOL') || upper.includes('MLB')) sport = 'BÉISBOL';
-        else if (upper.includes('UFC') || upper.includes('BOXEO')) sport = 'UFC';
-        else if (upper.includes('MOTOR') || upper.includes('F1') || upper.includes('GP')) sport = 'MOTOR';
+          // Asignación de categorías deportivas
+          let sport = 'FÚTBOL';
+          const upper = text.toUpperCase();
+          if (upper.includes('BALONCESTO') || upper.includes('BASKET') || upper.includes('NBA')) sport = 'BALONCESTO';
+          else if (upper.includes('HOCKEY') || upper.includes('NHL')) sport = 'HOCKEY';
+          else if (upper.includes('AMERICANO') || upper.includes('NFL')) sport = 'AMERICANO';
+          else if (upper.includes('BÉISBOL') || upper.includes('MLB')) sport = 'BÉISBOL';
+          else if (upper.includes('UFC') || upper.includes('BOXEO')) sport = 'UFC';
+          else if (upper.includes('MOTOR') || upper.includes('F1') || upper.includes('GP')) sport = 'MOTOR';
 
-        // Título del evento
-        let eventTitle = lines.find(l => l.includes('VS') || l.includes('vs') || l.includes('-')) || lines[0] || `Partido ${index + 1}`;
-        eventTitle = eventTitle.replace(/Canales|Ver en Vivo|CANALES Y ENLACES|LOCAL|•/gi, '').trim();
+          // Limpieza de título
+          let title = text
+            .replace(/\b\d{1,2}:\d{2}\b/g, '')
+            .replace(/Local\s*•?\s*\d+\/\d+/gi, '')
+            .replace(/FÚTBOL|BALONCESTO|HOCKEY|AMERICANO|BÉISBOL|UFC|BOXEO|MOTOR/gi, '')
+            .replace(/Canales\s*▼?|Ver en Vivo|CANALES Y ENLACES OFICIALES:?|EMISIÓN EN DIRECTO/gi, '')
+            .replace(/\s+/g, ' ')
+            .trim();
 
-        // Enlaces a canales
-        const aTags = Array.from(row.querySelectorAll('a'));
-        let options = [];
-        aTags.forEach((a, i) => {
-          let href = a.getAttribute('href') || a.href || '';
-          if (href && href !== '#' && !href.startsWith('javascript:')) {
-            try { href = new URL(href, 'https://tarjetarojadirect.live/').href; } catch(e){}
-            let name = (a.innerText || a.textContent || '').trim();
-            name = name.replace(/Canales\s*▼?/gi, '').trim();
-            if (!name || name.toLowerCase() === 'ver en vivo') name = `Canal ${options.length + 1}`;
-            
-            if (!options.some(o => o.url === href)) {
-              options.push({ name, url: href });
+          // Extraer enlaces a canales internos
+          let links = Array.from(el.querySelectorAll('a'));
+          if (links.length === 0 && el.parentElement) {
+            links = Array.from(el.parentElement.querySelectorAll('a'));
+          }
+
+          let options = [];
+          links.forEach((a) => {
+            let href = a.getAttribute('href') || a.href || '';
+            if (href && href !== '#' && !href.startsWith('javascript:')) {
+              try { href = new URL(href, 'https://tarjetarojadirect.live/').href; } catch(e){}
+              let name = (a.innerText || a.textContent || '').trim();
+              name = name.replace(/Canales\s*▼?/gi, '').trim();
+              if (!name || name.toLowerCase() === 'ver en vivo') name = `Canal ${options.length + 1}`;
+              
+              if (!options.some(o => o.url === href)) {
+                options.push({ name, url: href });
+              }
+            }
+          });
+
+          if (title.length > 3 && options.length > 0) {
+            if (!results.some(r => r.strEvent.toLowerCase() === title.toLowerCase())) {
+              results.push({
+                idEvent: 'match_' + index,
+                strEvent: title,
+                strLeague: sport,
+                strTime: time,
+                sport: sport,
+                options: options
+              });
             }
           }
-        });
-
-        if (options.length > 0 && !items.some(it => it.strEvent.toLowerCase() === eventTitle.toLowerCase())) {
-          items.push({
-            idEvent: 'tr_' + index,
-            strEvent: eventTitle,
-            strLeague: sport,
-            strTime: time,
-            sport: sport,
-            options: options
-          });
         }
       });
 
-      // Fallback de seguridad: si la estructura HTML cambia, extraer todos los hipervínculos válidos de la portada
-      if (items.length === 0) {
-        const links = Array.from(document.querySelectorAll('a'));
-        links.forEach((a, idx) => {
-          const txt = (a.innerText || a.textContent || '').trim();
-          let href = a.getAttribute('href') || '';
-          if (href && href !== '#' && !href.startsWith('javascript:') && (txt.includes('vs') || txt.includes('-') || /\b\d{2}:\d{2}\b/.test(txt))) {
-            try { href = new URL(href, 'https://tarjetarojadirect.live/').href; } catch(e){}
-            items.push({
-              idEvent: 'fb_' + idx,
-              strEvent: txt.replace(/\b\d{2}:\d{2}\b/g, '').trim() || `Evento Deportivo ${idx + 1}`,
-              strLeague: 'FÚTBOL',
-              strTime: (txt.match(/\b\d{2}:\d{2}\b/) || ['EN VIVO'])[0],
-              sport: 'FÚTBOL',
-              options: [{ name: 'Ver Transmisión', url: href }]
-            });
-          }
-        });
-      }
-
-      return items;
+      return results;
     });
 
     await browser.close();
 
-    // Ordenamiento por hora española (CET)
+    // Método de respaldo por HTTP si la evaluación profunda da 0 elementos
+    if (!events || events.length === 0) {
+      const fetchRes = await fetch('https://tarjetarojadirect.live/', {
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
+      });
+      const htmlText = await fetchRes.text();
+      const matchLinks = [...htmlText.matchAll(/<a[^>]+href=["']([^"']+)["'][^>]*>(.*?)<\/a>/gi)];
+      
+      let fallbackEvents = [];
+      matchLinks.forEach((m, i) => {
+        const url = m[1];
+        const label = m[2].replace(/<[^>]+>/g, '').trim();
+        if (url && (label.toLowerCase().includes('vs') || label.includes('-') || /\b\d{2}:\d{2}\b/.test(label))) {
+          let fullUrl = url;
+          try { fullUrl = new URL(url, 'https://tarjetarojadirect.live/').href; } catch(e){}
+          const time = (label.match(/\b\d{2}:\d{2}\b/) || ['EN VIVO'])[0];
+          fallbackEvents.push({
+            idEvent: 'fb_' + i,
+            strEvent: label.replace(/\b\d{2}:\d{2}\b/g, '').trim() || `Partido ${i + 1}`,
+            strLeague: 'FÚTBOL',
+            strTime: time,
+            sport: 'FÚTBOL',
+            options: [{ name: 'Ver en Vivo', url: fullUrl }]
+          });
+        }
+      });
+      events = fallbackEvents;
+    }
+
+    // Ordenamiento según hora de España (CET)
     const now = new Date();
     const currentMinutes = now.getHours() * 60 + now.getMinutes();
 
@@ -159,7 +168,7 @@ app.get('/api/agenda', async (req, res) => {
   }
 });
 
-// 2. HTTP Proxy Directo
+// 2. HTTP Proxy Directo Anti-Bloqueos
 app.get('/api/proxy', async (req, res) => {
   const targetUrl = req.query.url;
   if (!targetUrl) return res.status(400).send('Falta la URL');
