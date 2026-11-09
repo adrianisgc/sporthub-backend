@@ -13,7 +13,15 @@ const PUPPETEER_FLAGS = [
   '--single-process'
 ];
 
-// 1. Scraping Agenda (Fútbol, Básquet, Motor/F1)
+// Logos oficiales según la competición o deporte
+const LOGOS = {
+  MOTOR: 'https://upload.wikimedia.org/wikipedia/commons/thumb/3/33/F1.svg/512px-F1.svg.png',
+  BASKET: 'https://upload.wikimedia.org/wikipedia/commons/thumb/7/7a/NBA_logotype.svg/512px-NBA_logotype.svg.png',
+  CHAMPIONS: 'https://upload.wikimedia.org/wikipedia/commons/thumb/f/f3/UEFA_Champions_League_logo_2021.svg/512px-UEFA_Champions_League_logo_2021.svg.png',
+  FUTBOL: 'https://upload.wikimedia.org/wikipedia/commons/thumb/0/07/DAZN_Logo.svg/512px-DAZN_Logo.svg.png'
+};
+
+// 1. Scraping en directo de partidos y deportes de futbolvivo.tv
 app.get('/api/agenda', async (req, res) => {
   let browser = null;
   try {
@@ -21,11 +29,10 @@ app.get('/api/agenda', async (req, res) => {
     const page = await browser.newPage();
     
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
-    
     await page.goto('https://futbolvivo.tv/', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
     await new Promise(r => setTimeout(r, 1500));
 
-    const events = await page.evaluate(() => {
+    const events = await page.evaluate((defaultLogos) => {
       const links = Array.from(document.querySelectorAll('a'));
       let results = [];
 
@@ -51,17 +58,23 @@ app.get('/api/agenda', async (req, res) => {
 
         if (isMatch && href) {
           let timeMatch = text.match(/\b\d{2}:\d{2}\b/);
-          let time = timeMatch ? timeMatch[0] : 'En Vivo';
+          let time = timeMatch ? timeMatch[0] : 'EN VIVO';
           
           let eventName = text.replace(/\b\d{2}:\d{2}\b/g, '').trim();
           if (!eventName || eventName.length < 3) eventName = `Evento Deportivo ${index + 1}`;
 
           let sport = 'FUTBOL';
+          let logo = defaultLogos.FUTBOL;
           const lower = (eventName + ' ' + href).toLowerCase();
+
           if (lower.includes('f1') || lower.includes('formula') || lower.includes('moto') || lower.includes('nascar') || lower.includes('gp')) {
             sport = 'MOTOR';
+            logo = defaultLogos.MOTOR;
           } else if (lower.includes('basket') || lower.includes('nba') || lower.includes('acb') || lower.includes('euroleague')) {
             sport = 'BASKET';
+            logo = defaultLogos.BASKET;
+          } else if (lower.includes('champions') || lower.includes('ucl')) {
+            logo = defaultLogos.CHAMPIONS;
           }
 
           let existing = results.find(r => r.strEvent.toLowerCase() === eventName.toLowerCase());
@@ -73,9 +86,10 @@ app.get('/api/agenda', async (req, res) => {
             results.push({
               idEvent: 'ev_' + index,
               strEvent: eventName,
-              strLeague: sport === 'MOTOR' ? 'Motor / F1' : (sport === 'BASKET' ? 'Baloncesto' : 'Fútbol'),
+              strLeague: sport === 'MOTOR' ? 'F1 & Motor' : (sport === 'BASKET' ? 'Baloncesto' : 'Fútbol Directo'),
               strTime: time,
               sport: sport,
+              logo: logo,
               options: [{ name: 'Señal 1', url: href }]
             });
           }
@@ -83,17 +97,17 @@ app.get('/api/agenda', async (req, res) => {
       });
 
       return results;
-    });
+    }, LOGOS);
 
     await browser.close();
 
-    // Ordenar por hora española (CET) más cercana
+    // Orden por la hora de España (CET) más cercana al momento actual
     const now = new Date();
     const currentMinutes = now.getHours() * 60 + now.getMinutes();
 
     events.sort((a, b) => {
-      const isLiveA = a.strTime === 'En Vivo';
-      const isLiveB = b.strTime === 'En Vivo';
+      const isLiveA = a.strTime === 'EN VIVO' || a.strTime === 'En Vivo';
+      const isLiveB = b.strTime === 'EN VIVO' || b.strTime === 'En Vivo';
 
       if (isLiveA && isLiveB) return 0;
       if (isLiveA) return -1;
@@ -127,7 +141,7 @@ app.get('/api/agenda', async (req, res) => {
   }
 });
 
-// 2. HTTP Proxy con bypass de Mixed Content (HTTP -> HTTPS) y extracción de redirectus.net
+// 2. HTTP Proxy Directo
 app.get('/api/proxy', async (req, res) => {
   const targetUrl = req.query.url;
   if (!targetUrl) return res.status(400).send('Falta la URL');
@@ -144,7 +158,6 @@ app.get('/api/proxy', async (req, res) => {
 
     let html = await response.text();
 
-    // Extraer enlaces de servidores de streaming (redirectus.net, latin, us.html, etc.)
     const streamMatches = [
       ...html.matchAll(/(https?:\/\/[^"'\s<>]*redirectus[^"'\s<>]*)/gi),
       ...html.matchAll(/(https?:\/\/[^"'\s<>]*latin\/[^"'\s<>]*)/gi),
@@ -168,7 +181,6 @@ app.get('/api/proxy', async (req, res) => {
         finalPlayerUrl = `${parsedUrl.protocol}//${parsedUrl.host}${finalPlayerUrl}`;
       }
 
-      // Transformar HTTP a HTTPS para evitar el bloqueo del navegador en Netlify
       finalPlayerUrl = finalPlayerUrl.replace(/^http:\/\//i, 'https://');
 
       res.removeHeader('X-Frame-Options');
@@ -247,7 +259,7 @@ app.get('/api/proxy', async (req, res) => {
   } catch (e) {
     return res.status(500).send(`
       <style>body{background:#060913;color:#fff;font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;}</style>
-      <div style="text-align:center;"><h3>Error al cargar el reproductor</h3></div>
+      <div style="text-align:center;"><h3>Error al conectar con la emisión</h3></div>
     `);
   }
 });
