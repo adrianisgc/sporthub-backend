@@ -13,15 +13,7 @@ const PUPPETEER_FLAGS = [
   '--single-process'
 ];
 
-// Logos oficiales según la competición o deporte
-const LOGOS = {
-  MOTOR: 'https://upload.wikimedia.org/wikipedia/commons/thumb/3/33/F1.svg/512px-F1.svg.png',
-  BASKET: 'https://upload.wikimedia.org/wikipedia/commons/thumb/7/7a/NBA_logotype.svg/512px-NBA_logotype.svg.png',
-  CHAMPIONS: 'https://upload.wikimedia.org/wikipedia/commons/thumb/f/f3/UEFA_Champions_League_logo_2021.svg/512px-UEFA_Champions_League_logo_2021.svg.png',
-  FUTBOL: 'https://upload.wikimedia.org/wikipedia/commons/thumb/0/07/DAZN_Logo.svg/512px-DAZN_Logo.svg.png'
-};
-
-// 1. Scraping en directo de partidos y deportes de futbolvivo.tv
+// 1. Scraping de la Agenda Completa directamente desde Tarjeta Roja Directa
 app.get('/api/agenda', async (req, res) => {
   let browser = null;
   try {
@@ -29,10 +21,12 @@ app.get('/api/agenda', async (req, res) => {
     const page = await browser.newPage();
     
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
-    await page.goto('https://futbolvivo.tv/', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+    
+    // Carga directa de la web de Tarjeta Roja Directa
+    await page.goto('https://tarjetarojadirect.live/', { waitUntil: 'domcontentloaded', timeout: 35000 }).catch(() => {});
     await new Promise(r => setTimeout(r, 1500));
 
-    const events = await page.evaluate((defaultLogos) => {
+    const events = await page.evaluate(() => {
       const links = Array.from(document.querySelectorAll('a'));
       let results = [];
 
@@ -43,12 +37,13 @@ app.get('/api/agenda', async (req, res) => {
         if (!href || href === '#' || href.startsWith('javascript:')) return;
 
         try {
-          href = new URL(href, window.location.origin).href;
+          href = new URL(href, 'https://tarjetarojadirect.live/').href;
         } catch(e) {}
 
         const text = rawText.replace(/\s+/g, ' ');
         const lowerText = text.toLowerCase();
 
+        // Filtro para capturar los partidos y eventos de Tarjeta Roja
         const isMatch = lowerText.includes('vs') || 
                         text.includes('-') || 
                         lowerText.includes('f1') || 
@@ -64,23 +59,17 @@ app.get('/api/agenda', async (req, res) => {
           if (!eventName || eventName.length < 3) eventName = `Evento Deportivo ${index + 1}`;
 
           let sport = 'FUTBOL';
-          let logo = defaultLogos.FUTBOL;
           const lower = (eventName + ' ' + href).toLowerCase();
-
-          if (lower.includes('f1') || lower.includes('formula') || lower.includes('moto') || lower.includes('nascar') || lower.includes('gp')) {
+          if (lower.includes('f1') || lower.includes('formula') || lower.includes('moto') || lower.includes('nascar') || lower.includes('gp') || lower.includes('indy')) {
             sport = 'MOTOR';
-            logo = defaultLogos.MOTOR;
           } else if (lower.includes('basket') || lower.includes('nba') || lower.includes('acb') || lower.includes('euroleague')) {
             sport = 'BASKET';
-            logo = defaultLogos.BASKET;
-          } else if (lower.includes('champions') || lower.includes('ucl')) {
-            logo = defaultLogos.CHAMPIONS;
           }
 
           let existing = results.find(r => r.strEvent.toLowerCase() === eventName.toLowerCase());
           if (existing) {
             if (!existing.options.some(o => o.url === href)) {
-              existing.options.push({ name: `Señal ${existing.options.length + 1}`, url: href });
+              existing.options.push({ name: `Canal ${existing.options.length + 1}`, url: href });
             }
           } else {
             results.push({
@@ -89,19 +78,18 @@ app.get('/api/agenda', async (req, res) => {
               strLeague: sport === 'MOTOR' ? 'F1 & Motor' : (sport === 'BASKET' ? 'Baloncesto' : 'Fútbol Directo'),
               strTime: time,
               sport: sport,
-              logo: logo,
-              options: [{ name: 'Señal 1', url: href }]
+              options: [{ name: 'Canal 1', url: href }]
             });
           }
         }
       });
 
       return results;
-    }, LOGOS);
+    });
 
     await browser.close();
 
-    // Orden por la hora de España (CET) más cercana al momento actual
+    // Ordenar agenda por la hora de España (CET) más cercana
     const now = new Date();
     const currentMinutes = now.getHours() * 60 + now.getMinutes();
 
@@ -141,7 +129,7 @@ app.get('/api/agenda', async (req, res) => {
   }
 });
 
-// 2. HTTP Proxy Directo
+// 2. HTTP Proxy Directo configurado para Tarjeta Roja Directa
 app.get('/api/proxy', async (req, res) => {
   const targetUrl = req.query.url;
   if (!targetUrl) return res.status(400).send('Falta la URL');
@@ -151,13 +139,14 @@ app.get('/api/proxy', async (req, res) => {
     const response = await fetch(targetUrl, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Referer': 'https://futbolvivo.tv/',
+        'Referer': 'https://tarjetarojadirect.live/',
         'Accept-Language': 'es-ES,es;q=0.9'
       }
     });
 
     let html = await response.text();
 
+    // Extraer enlaces de servidores de emisión asociados a Tarjeta Roja
     const streamMatches = [
       ...html.matchAll(/(https?:\/\/[^"'\s<>]*redirectus[^"'\s<>]*)/gi),
       ...html.matchAll(/(https?:\/\/[^"'\s<>]*latin\/[^"'\s<>]*)/gi),
@@ -259,10 +248,10 @@ app.get('/api/proxy', async (req, res) => {
   } catch (e) {
     return res.status(500).send(`
       <style>body{background:#060913;color:#fff;font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;}</style>
-      <div style="text-align:center;"><h3>Error al conectar con la emisión</h3></div>
+      <div style="text-align:center;"><h3>Error al cargar el reproductor</h3></div>
     `);
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Servidor SportHub Pro activo en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Servidor SportHub Pro (Tarjeta Roja Directa Source) activo en puerto ${PORT}`));
