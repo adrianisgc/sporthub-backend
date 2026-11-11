@@ -4,19 +4,13 @@ const cors = require('cors');
 const app = express();
 app.use(cors());
 
-// Cabeceras anti-bot completas para evitar bloqueos 403 / Cloudflare en Render
-const BROWSER_HEADERS = {
+const HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
   'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
   'Sec-Ch-Ua': '"Chromium";v="124", "Google Chrome";v="124"',
   'Sec-Ch-Ua-Mobile': '?0',
-  'Sec-Ch-Ua-Platform': '"Windows"',
-  'Sec-Fetch-Dest': 'document',
-  'Sec-Fetch-Mode': 'navigate',
-  'Sec-Fetch-Site': 'none',
-  'Sec-Fetch-User': '?1',
-  'Upgrade-Insecure-Requests': '1'
+  'Sec-Ch-Ua-Platform': '"Windows"'
 };
 
 let cache = { data: null, time: 0 };
@@ -28,17 +22,15 @@ app.get('/api/agenda', async (req, res) => {
   }
 
   try {
-    let events = await scrapeTarget('https://tarjetarojadirect.live/');
-    
-    // Si la web principal no devuelve partidos por bloqueo de IP, usar fuente de respaldo instantánea
+    let events = await fetchTRLive('https://tarjetarojadirect.live/');
+
+    // Fuente de respaldo si la IP de Render sufre bloqueo temporal
     if (!events || events.length === 0) {
-      events = await scrapeTarget('https://futbolvivo.tv/');
+      events = await fetchTRLive('https://futbolvivo.tv/');
     }
 
     const payload = { success: true, count: events.length, events };
-    if (events.length > 0) {
-      cache = { data: payload, time: now };
-    }
+    if (events.length > 0) cache = { data: payload, time: now };
     return res.json(payload);
 
   } catch (error) {
@@ -47,9 +39,9 @@ app.get('/api/agenda', async (req, res) => {
   }
 });
 
-async function scrapeTarget(targetUrl) {
+async function fetchTRLive(targetUrl) {
   try {
-    const response = await fetch(targetUrl, { headers: BROWSER_HEADERS });
+    const response = await fetch(targetUrl, { headers: HEADERS });
     if (!response.ok) return [];
     const html = await response.text();
 
@@ -88,10 +80,18 @@ async function scrapeTarget(targetUrl) {
         else if (upper.includes('UFC') || upper.includes('BOXEO')) sport = 'UFC';
         else if (upper.includes('MOTOR') || upper.includes('F1') || upper.includes('GP')) sport = 'MOTOR';
 
+        // Detectar bandera
+        let flag = '⚽';
+        if (sport === 'BALONCESTO') flag = '🏀';
+        else if (sport === 'MOTOR') flag = '🏎️';
+        else if (sport === 'UFC') flag = '🥊';
+        else if (cleanTitle.toLowerCase().includes('segunda') || cleanTitle.toLowerCase().includes('laliga')) flag = '🇪🇸';
+        else if (cleanTitle.toLowerCase().includes('fa cup') || cleanTitle.toLowerCase().includes('premier')) flag = '🇬🇧';
+
         let existing = events.find(e => e.strEvent.toLowerCase() === cleanTitle.toLowerCase());
         if (existing) {
           if (!existing.options.some(o => o.url === fullUrl)) {
-            existing.options.push({ name: `Canal ${existing.options.length + 1}`, url: fullUrl });
+            existing.options.push({ name: `Canal ${existing.options.length + 1}`, url: fullUrl, lang: 'Español' });
           }
         } else {
           events.push({
@@ -100,7 +100,8 @@ async function scrapeTarget(targetUrl) {
             strLeague: sport,
             strTime: time,
             sport: sport,
-            options: [{ name: 'Canal 1', url: fullUrl }]
+            flag: flag,
+            options: [{ name: 'Canal 1', url: fullUrl, lang: 'Español' }]
           });
         }
       }
@@ -111,7 +112,7 @@ async function scrapeTarget(targetUrl) {
   }
 }
 
-// Proxy Anti-Publicidad para la reproducción
+// Proxy Anti-Publicidad
 app.get('/api/proxy', async (req, res) => {
   const targetUrl = req.query.url;
   if (!targetUrl) return res.status(400).send('Falta la URL');
@@ -120,7 +121,7 @@ app.get('/api/proxy', async (req, res) => {
     let parsedUrl = new URL(targetUrl);
     const response = await fetch(targetUrl, {
       headers: {
-        'User-Agent': BROWSER_HEADERS['User-Agent'],
+        'User-Agent': HEADERS['User-Agent'],
         'Referer': `${parsedUrl.protocol}//${parsedUrl.host}/`,
         'Accept-Language': 'es-ES,es;q=0.9'
       }
