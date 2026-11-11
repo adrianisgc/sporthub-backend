@@ -1,153 +1,130 @@
 const express = require('express');
 const cors = require('cors');
+const puppeteer = require('puppeteer');
 
 const app = express();
 app.use(cors());
-
-// Cabeceras exactas para simular un navegador real y evitar bloqueos de Cloudflare
-const HEADERS = {
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-  'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
-  'Cache-Control': 'no-cache',
-  'Sec-Fetch-Dest': 'document',
-  'Sec-Fetch-Mode': 'navigate',
-  'Sec-Fetch-Site': 'none',
-  'Upgrade-Insecure-Requests': '1'
-};
 
 let cache = { data: null, time: 0 };
 
 app.get('/api/agenda', async (req, res) => {
   const now = Date.now();
-  if (cache.data && (now - cache.time < 45000)) {
+  // Caché de 2 minutos para no sobrecargar el servidor
+  if (cache.data && (now - cache.time < 120000)) {
     return res.json(cache.data);
   }
 
-  // Multi-espejo: Si el dominio principal bloquea la IP de Render, usa alternativas exactas
-  const mirrors = [
-    'https://tarjetarojadirect.live/',
-    'https://futbolvivo.tv/',
-    'https://pirlotv.fr/'
-  ];
+  let browser = null;
+  try {
+    browser = await puppeteer.launch({
+      headless: "new",
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--single-process']
+    });
+    
+    const page = await browser.newPage();
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36');
+    await page.goto('https://tarjetarojadirect.live/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    
+    // Esperar un poco para que Cloudflare resuelva
+    await new Promise(r => setTimeout(r, 2000));
 
-  let events = [];
-  let errorMsg = '';
+    const events = await page.evaluate(() => {
+      let results = [];
+      // Extraer todas las filas de la web
+      const rows = Array.from(document.querySelectorAll('li, tr, article, .match, .row'));
 
-  for (let url of mirrors) {
-    try {
-      events = await scrapeTarget(url);
-      if (events.length > 0) break; // Si encuentra partidos, detiene la búsqueda
-    } catch (e) {
-      errorMsg = e.message;
+      rows.forEach(row => {
+        const text = row.innerText.replace(/\s+/g, ' ').trim();
+        
+        // FILTRO ESTRICTO: Debe tener una hora (ej. 15:30) y el texto "VS" o "-"
+        const timeMatch = text.match(/\b\d{1,2}:\d{2}\b/);
+        const isLive = text.toLowerCase().includes('en vivo');
+        const hasVs = text.toLowerCase().includes('vs') || text.includes('-');
+        
+        // Ignorar textos basura del footer como "Aviso Legal" o "Tarjeta Roja TV"
+        if (text.toLowerCase().includes('aviso legal') || text.toLowerCase().includes('pirlo tv')) return;
+
+        if ((timeMatch || isLive) && hasVs) {
+          const time = isLive ? 'EN VIVO' : timeMatch[0];
+          
+          // Extraer enlaces de este partido
+          const links = Array.from(row.querySelectorAll('a'));
+          let options = [];
+          
+          links.forEach(a => {
+            if (a.href && !a.href.includes('javascript') && a.href !== '#') {
+              let btnText = a.innerText.replace(/Canales\s*▼?/gi, '').trim();
+              if (!btnText || btnText.toLowerCase() === 'ver en vivo') btnText = `Canal ${options.length + 1}`;
+              
+              // Evitar meter enlaces del footer
+              if (!btnText.toLowerCase().includes('aviso legal')) {
+                options.push({ name: btnText, url: a.href, lang: 'ES' });
+              }
+            }
+          });
+
+          // Limpiar el título
+          let title = text.replace(/\b\d{1,2}:\d{2}\b/g, '').replace(/Ver en Vivo|Canales|▼/gi, '').trim();
+          
+          let sport = 'FÚTBOL';
+          const upper = text.toUpperCase();
+          if (upper.includes('BALONCESTO') || upper.includes('NBA')) sport = 'BALONCESTO';
+          else if (upper.includes('HOCKEY') || upper.includes('NHL')) sport = 'HOCKEY';
+          else if (upper.includes('AMERICANO') || upper.includes('NFL')) sport = 'AMERICANO';
+          else if (upper.includes('BÉISBOL') || upper.includes('MLB')) sport = 'BÉISBOL';
+          else if (upper.includes('MOTOR') || upper.includes('F1')) sport = 'MOTOR';
+
+          if (title.length > 5 && options.length > 0) {
+            // Evitar duplicados
+            if (!results.some(r => r.strEvent === title)) {
+              results.push({
+                idEvent: 'tr_' + results.length,
+                strEvent: title,
+                strTime: time,
+                sport: sport,
+                options: options
+              });
+            }
+          }
+        }
+      });
+      return results;
+    });
+
+    await browser.close();
+
+    if (events.length > 0) {
+      const payload = { success: true, count: events.length, events };
+      cache = { data: payload, time: now };
+      return res.json(payload);
+    } else {
+      throw new Error("Cloudflare bloqueó la carga o cambió la estructura.");
     }
-  }
 
-  if (events.length > 0) {
-    const payload = { success: true, count: events.length, events };
-    cache = { data: payload, time: now };
-    return res.json(payload);
-  } else {
+  } catch (error) {
+    if (browser) await browser.close().catch(()=>({}));
     if (cache.data) return res.json(cache.data);
-    return res.json({ success: false, count: 0, events: [], error: 'Bloqueo de red en todos los espejos.' });
+    return res.json({ success: false, count: 0, events: [], error: error.message });
   }
 });
 
-async function scrapeTarget(targetUrl) {
-  const response = await fetch(targetUrl, { headers: HEADERS });
-  if (!response.ok) return [];
-  const html = await response.text();
-
-  let events = [];
-  const regexBloques = /<(li|tr|div)[^>]*>(.*?)<\/\1>/gis;
-  let bloqueMatch;
-
-  while ((bloqueMatch = regexBloques.exec(html)) !== null) {
-    const htmlBloque = bloqueMatch[2];
-    
-    // Buscar enlaces y horas en el bloque
-    const timeMatch = htmlBloque.match(/\b\d{1,2}:\d{2}\b/);
-    const isLive = htmlBloque.toLowerCase().includes('en vivo');
-    
-    if (!timeMatch && !isLive) continue;
-
-    const time = isLive ? 'EN VIVO' : timeMatch[0];
-    
-    const linksRegex = /<a[^>]+href=["']([^"']+)["'][^>]*>(.*?)<\/a>/gi;
-    let linkMatch;
-    let enlaces = [];
-    
-    while ((linkMatch = linksRegex.exec(htmlBloque)) !== null) {
-      const href = linkMatch[1];
-      const text = linkMatch[2].replace(/<[^>]+>/g, '').trim();
-      if (href && href !== '#' && !href.startsWith('javascript')) {
-        let finalUrl = href;
-        try { finalUrl = new URL(href, targetUrl).href; } catch(e){}
-        enlaces.push({ url: finalUrl, text: text });
-      }
-    }
-
-    if (enlaces.length === 0) continue;
-
-    let title = "";
-    let options = [];
-    
-    enlaces.forEach((l, index) => {
-      if (l.text.toLowerCase().includes('vs') || l.text.includes('-')) {
-        title = l.text;
-      } else {
-        let nombre = l.text.replace(/Canales\s*▼?/gi, '').trim();
-        if (!nombre || nombre.toLowerCase() === 'ver en vivo') nombre = `Canal ${options.length + 1}`;
-        options.push({ name: nombre, url: l.url, lang: 'Español' });
-      }
-    });
-
-    if (!title && enlaces.length > 0) {
-      title = enlaces[0].text;
-    }
-
-    let cleanTitle = title.replace(/\b\d{1,2}:\d{2}\b/g, '').trim();
-    if (cleanTitle.length < 5) continue;
-
-    let sport = 'FÚTBOL';
-    const upper = htmlBloque.toUpperCase();
-    if (upper.includes('BALONCESTO') || upper.includes('NBA')) sport = 'BALONCESTO';
-    else if (upper.includes('HOCKEY') || upper.includes('NHL')) sport = 'HOCKEY';
-    else if (upper.includes('AMERICANO') || upper.includes('NFL')) sport = 'AMERICANO';
-    else if (upper.includes('BÉISBOL') || upper.includes('MLB')) sport = 'BÉISBOL';
-    else if (upper.includes('UFC') || upper.includes('BOXEO')) sport = 'UFC';
-    else if (upper.includes('MOTOR') || upper.includes('F1')) sport = 'MOTOR';
-
-    if (options.length === 0) {
-      options.push({ name: 'Emisión 1', url: enlaces[0].url, lang: 'Español' });
-    }
-
-    if (!events.some(e => e.strEvent === cleanTitle)) {
-      events.push({
-        idEvent: 'tr_' + events.length,
-        strEvent: cleanTitle,
-        sport: sport,
-        strTime: time,
-        options: options
-      });
-    }
-  }
-
-  return events;
-}
-
-// Proxy de Emisión
+// Proxy de Reproducción Directa
 app.get('/api/proxy', async (req, res) => {
   const targetUrl = req.query.url;
   if (!targetUrl) return res.status(400).send('Falta la URL');
 
   try {
-    let parsedUrl = new URL(targetUrl);
     const response = await fetch(targetUrl, {
-      headers: { 'User-Agent': HEADERS['User-Agent'], 'Referer': 'https://tarjetarojadirect.live/' }
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Referer': 'https://tarjetarojadirect.live/'
+      }
     });
 
     let html = await response.text();
+    let parsedUrl = new URL(targetUrl);
+
+    // Buscar iFrames de reproductores comunes
     const streamMatches = [
       ...html.matchAll(/(https?:\/\/[^"'\s<>]*redirectus[^"'\s<>]*)/gi),
       ...html.matchAll(/(https?:\/\/[^"'\s<>]*latin\/[^"'\s<>]*)/gi),
@@ -160,8 +137,7 @@ app.get('/api/proxy', async (req, res) => {
     if (finalPlayerUrl) {
       if (finalPlayerUrl.startsWith('//')) finalPlayerUrl = 'https:' + finalPlayerUrl;
       else if (finalPlayerUrl.startsWith('/')) finalPlayerUrl = `${parsedUrl.protocol}//${parsedUrl.host}${finalPlayerUrl}`;
-      finalPlayerUrl = finalPlayerUrl.replace(/^http:\/\//i, 'https://');
-
+      
       res.removeHeader('X-Frame-Options');
       res.removeHeader('Content-Security-Policy');
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
@@ -177,7 +153,7 @@ app.get('/api/proxy', async (req, res) => {
     return res.send(html);
 
   } catch (e) {
-    return res.status(500).send('<body style="background:#000;color:#fff;display:flex;justify-content:center;align-items:center;height:100vh;">Error en la emisión.</body>');
+    return res.status(500).send('<body style="background:#000;color:#fff;display:flex;justify-content:center;align-items:center;height:100vh;">Error cargando señal.</body>');
   }
 });
 
