@@ -1,140 +1,36 @@
 const express = require('express');
 const cors = require('cors');
-const puppeteer = require('puppeteer');
 
 const app = express();
 app.use(cors());
 
-const PUPPETEER_FLAGS = [
-  '--no-sandbox',
-  '--disable-setuid-sandbox',
-  '--disable-dev-shm-usage',
-  '--disable-gpu',
-  '--single-process'
-];
-
-const BROWSER_HEADERS = {
+const HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-  'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8'
+  'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
+  'Cache-Control': 'no-cache'
 };
 
-// 1. Agenda con extracción completa de múltiples opciones de emisión por partido
+// Cache en memoria para servir la agenda en <50ms
+let agendaCache = { data: null, timestamp: 0 };
+const CACHE_TTL = 45 * 1000; // 45 segundos
+
 app.get('/api/agenda', async (req, res) => {
-  let browser = null;
+  const now = Date.now();
+  if (agendaCache.data && (now - agendaCache.timestamp < CACHE_TTL)) {
+    return res.json(agendaCache.data);
+  }
+
   try {
-    browser = await puppeteer.launch({ headless: true, args: PUPPETEER_FLAGS });
-    const page = await browser.newPage();
-    await page.setUserAgent(BROWSER_HEADERS['User-Agent']);
-    
-    await page.goto('https://tarjetarojadirect.live/', { waitUntil: 'domcontentloaded', timeout: 35000 }).catch(() => {});
-    await new Promise(r => setTimeout(r, 2000));
+    const response = await fetch('https://tarjetarojadirect.live/', { headers: HEADERS });
+    if (!response.ok) throw new Error('Error al conectar con la fuente');
+    const html = await response.text();
 
-    let events = await page.evaluate(() => {
-      let results = [];
-      const nodes = Array.from(document.querySelectorAll('div, tr, li, article, section, p'));
+    const events = parseTarjetaRojaHTML(html);
 
-      nodes.forEach((el, index) => {
-        const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
-        const hasTime = /\b\d{1,2}:\d{2}\b/.test(text);
-        const hasVs = text.toLowerCase().includes('vs') || text.includes('-');
-        
-        if (hasTime && hasVs && el.children.length < 15) {
-          const timeMatch = text.match(/\b\d{1,2}:\d{2}\b/);
-          const time = timeMatch ? timeMatch[0] : 'EN VIVO';
-
-          let sport = 'FÚTBOL';
-          const upper = text.toUpperCase();
-          if (upper.includes('BALONCESTO') || upper.includes('BASKET') || upper.includes('NBA')) sport = 'BALONCESTO';
-          else if (upper.includes('HOCKEY') || upper.includes('NHL')) sport = 'HOCKEY';
-          else if (upper.includes('AMERICANO') || upper.includes('NFL')) sport = 'AMERICANO';
-          else if (upper.includes('BÉISBOL') || upper.includes('MLB')) sport = 'BÉISBOL';
-          else if (upper.includes('UFC') || upper.includes('BOXEO')) sport = 'UFC';
-          else if (upper.includes('MOTOR') || upper.includes('F1') || upper.includes('GP')) sport = 'MOTOR';
-
-          let title = text
-            .replace(/\b\d{1,2}:\d{2}\b/g, '')
-            .replace(/Local\s*•?\s*\d+\/\d+/gi, '')
-            .replace(/FÚTBOL|BALONCESTO|HOCKEY|AMERICANO|BÉISBOL|UFC|BOXEO|MOTOR/gi, '')
-            .replace(/Canales\s*▼?|Ver en Vivo|CANALES Y ENLACES OFICIALES:?|EMISIÓN EN DIRECTO/gi, '')
-            .replace(/\s+/g, ' ')
-            .trim();
-
-          let links = Array.from(el.querySelectorAll('a'));
-          if (links.length === 0 && el.parentElement) {
-            links = Array.from(el.parentElement.querySelectorAll('a'));
-          }
-
-          let options = [];
-          links.forEach((a) => {
-            let href = a.getAttribute('href') || a.href || '';
-            if (href && href !== '#' && !href.startsWith('javascript:')) {
-              try { href = new URL(href, 'https://tarjetarojadirect.live/').href; } catch(e){}
-              let rawLabel = (a.innerText || a.textContent || '').trim().replace(/Canales\s*▼?/gi, '').trim();
-              
-              let optName = rawLabel && rawLabel.toLowerCase() !== 'ver en vivo' 
-                ? rawLabel 
-                : `Opción ${options.length + 1}`;
-              
-              if (!options.some(o => o.url === href)) {
-                options.push({ name: optName, url: href });
-              }
-            }
-          });
-
-          if (title.length > 3 && options.length > 0) {
-            if (!results.some(r => r.strEvent.toLowerCase() === title.toLowerCase())) {
-              results.push({
-                idEvent: 'match_' + index,
-                strEvent: title,
-                strLeague: sport,
-                strTime: time,
-                sport: sport,
-                options: options
-              });
-            }
-          }
-        }
-      });
-
-      return results;
-    });
-
-    await browser.close();
-
-    // Respaldo de seguridad HTTP instantáneo si el renderizado dinámico falla
-    if (!events || events.length === 0) {
-      const fetchRes = await fetch('https://tarjetarojadirect.live/', { headers: BROWSER_HEADERS });
-      const htmlText = await fetchRes.text();
-      const matchLinks = [...htmlText.matchAll(/<a[^>]+href=["']([^"']+)["'][^>]*>(.*?)<\/a>/gi)];
-      
-      let fallbackEvents = [];
-      matchLinks.forEach((m, i) => {
-        const url = m[1];
-        const label = m[2].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
-        if (url && (label.toLowerCase().includes('vs') || label.includes('-') || /\b\d{2}:\d{2}\b/.test(label))) {
-          let fullUrl = url;
-          try { fullUrl = new URL(url, 'https://tarjetarojadirect.live/').href; } catch(e){}
-          const time = (label.match(/\b\d{2}:\d{2}\b/) || ['EN VIVO'])[0];
-          fallbackEvents.push({
-            idEvent: 'fb_' + i,
-            strEvent: label.replace(/\b\d{2}:\d{2}\b/g, '').trim() || `Partido ${i + 1}`,
-            strLeague: 'FÚTBOL',
-            strTime: time,
-            sport: 'FÚTBOL',
-            options: [
-              { name: 'Opción 1', url: fullUrl },
-              { name: 'Opción 2', url: fullUrl }
-            ]
-          });
-        }
-      });
-      events = fallbackEvents;
-    }
-
-    // Ordenamiento según hora de España (CET)
-    const now = new Date();
-    const currentMinutes = now.getHours() * 60 + now.getMinutes();
+    // Ordenar agenda por la hora de España (CET)
+    const dateNow = new Date();
+    const currentMinutes = dateNow.getHours() * 60 + dateNow.getMinutes();
 
     events.sort((a, b) => {
       const isLiveA = a.strTime === 'EN VIVO' || a.strTime === 'En Vivo';
@@ -164,15 +60,95 @@ app.get('/api/agenda', async (req, res) => {
       return diffA - diffB;
     });
 
-    return res.json({ success: true, count: events.length, events });
+    const resultPayload = { success: true, count: events.length, events };
+    agendaCache = { data: resultPayload, timestamp: now };
+    return res.json(resultPayload);
 
   } catch (error) {
-    if (browser) await browser.close().catch(() => {});
+    if (agendaCache.data) return res.json(agendaCache.data);
     return res.json({ success: false, count: 0, events: [], error: error.message });
   }
 });
 
-// 2. HTTP Proxy Directo
+function parseTarjetaRojaHTML(html) {
+  let results = [];
+  
+  // Extraer bloques de partidos
+  const matchBlockRegex = /<(div|li|article|tr)[^>]*>(.*?)<\/\1>/gis;
+  const linkRegex = /<a[^>]+href=["']([^"']+)["'][^>]*>(.*?)<\/a>/gi;
+  
+  // Extraer todos los hipervínculos válidos de tarjetarojadirect.live
+  let allLinks = [];
+  let match;
+  while ((match = linkRegex.exec(html)) !== null) {
+    const href = match[1];
+    const text = match[2].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+    if (href && href !== '#' && !href.startsWith('javascript:') && text.length > 2) {
+      let fullUrl = href;
+      try { fullUrl = new URL(href, 'https://tarjetarojadirect.live/').href; } catch(e){}
+      allLinks.push({ text, url: fullUrl });
+    }
+  }
+
+  // Agrupar enlaces por eventos
+  let currentEvent = null;
+
+  allLinks.forEach((item, idx) => {
+    const rawText = item.text;
+    const timeMatch = rawText.match(/\b\d{1,2}:\d{2}\b/);
+    const hasVs = rawText.toLowerCase().includes('vs') || rawText.includes('-') || rawText.toLowerCase().includes('f1');
+
+    if (hasVs || timeMatch) {
+      const time = timeMatch ? timeMatch[0] : 'EN VIVO';
+      let title = rawText
+        .replace(/\b\d{1,2}:\d{2}\b/g, '')
+        .replace(/Ver en Vivo|Canales\s*▼?|LOCAL|•/gi, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+      if (!title || title.length < 3) title = `Partido ${results.length + 1}`;
+
+      let sport = 'FÚTBOL';
+      const upper = rawText.toUpperCase();
+      if (upper.includes('BALONCESTO') || upper.includes('BASKET') || upper.includes('NBA')) sport = 'BALONCESTO';
+      else if (upper.includes('HOCKEY') || upper.includes('NHL')) sport = 'HOCKEY';
+      else if (upper.includes('AMERICANO') || upper.includes('NFL')) sport = 'AMERICANO';
+      else if (upper.includes('BÉISBOL') || upper.includes('MLB')) sport = 'BÉISBOL';
+      else if (upper.includes('UFC') || upper.includes('BOXEO')) sport = 'UFC';
+      else if (upper.includes('MOTOR') || upper.includes('F1') || upper.includes('GP')) sport = 'MOTOR';
+
+      let existing = results.find(r => r.strEvent.toLowerCase() === title.toLowerCase());
+
+      if (existing) {
+        if (!existing.options.some(o => o.url === item.url)) {
+          let name = rawText.includes('Canal') || rawText.includes('Señal') || rawText.includes('TV')
+            ? rawText
+            : `Canal ${existing.options.length + 1}`;
+          existing.options.push({ name, url: item.url });
+        }
+      } else {
+        results.push({
+          idEvent: 'tr_' + idx,
+          strEvent: title,
+          strLeague: sport,
+          strTime: time,
+          sport: sport,
+          options: [{ name: 'Canal 1', url: item.url }]
+        });
+      }
+    } else if (results.length > 0) {
+      // Si el enlace es de un canal secundario (ej. "LaLiga TV", "Canal 2 HD")
+      let lastEvent = results[results.length - 1];
+      if (!lastEvent.options.some(o => o.url === item.url)) {
+        lastEvent.options.push({ name: item.text || `Canal ${lastEvent.options.length + 1}`, url: item.url });
+      }
+    }
+  });
+
+  return results;
+}
+
+// Proxy Anti-Bloqueos y Anti-Publicidad
 app.get('/api/proxy', async (req, res) => {
   const targetUrl = req.query.url;
   if (!targetUrl) return res.status(400).send('Falta la URL');
@@ -181,7 +157,7 @@ app.get('/api/proxy', async (req, res) => {
     let parsedUrl = new URL(targetUrl);
     const response = await fetch(targetUrl, {
       headers: {
-        'User-Agent': BROWSER_HEADERS['User-Agent'],
+        'User-Agent': HEADERS['User-Agent'],
         'Referer': 'https://tarjetarojadirect.live/',
         'Accept-Language': 'es-ES,es;q=0.9'
       }
@@ -262,17 +238,6 @@ app.get('/api/proxy', async (req, res) => {
             Object.defineProperty(window, 'top', { get: function() { return window.self; } });
             Object.defineProperty(window, 'parent', { get: function() { return window.self; } });
           } catch(e) {}
-
-          document.addEventListener('DOMContentLoaded', function() {
-            setTimeout(function() {
-              var btns = Array.from(document.querySelectorAll('button, a, .opcion, .senial, [class*="option"], [class*="btn"]'));
-              var target = btns.find(function(el) {
-                var t = (el.innerText || '').toLowerCase();
-                return t.includes('opcion') || t.includes('opción') || t.includes('señal') || t.includes('senial') || t.includes('stream') || t.includes('ver');
-              });
-              if (target) target.click();
-            }, 300);
-          });
         </script>
     `;
 
@@ -290,7 +255,7 @@ app.get('/api/proxy', async (req, res) => {
   } catch (e) {
     return res.status(500).send(`
       <style>body{background:#060913;color:#fff;font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;}</style>
-      <div style="text-align:center;"><h3>Error al cargar el reproductor</h3></div>
+      <div style="text-align:center;"><h3>Error al cargar la transmisión</h3></div>
     `);
   }
 });
